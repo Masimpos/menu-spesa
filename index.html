@@ -241,6 +241,13 @@ button.link {
   outline-offset: 2px;
 }
 
+/* «Importa JSON»: l'input file è nascosto visivamente ma raggiungibile con Tab;
+   l'anello di focus va mostrato sulla label-bottone che lo rappresenta. */
+#import-file:focus-visible + label {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
 .visually-hidden {
   position: absolute !important;
   left: 0 !important;
@@ -1124,7 +1131,7 @@ dialog.dialog-fallback[open] {
 </head>
 <body>
   <header class="app-header">
-    <h1 id="section-title">Menu</h1>
+    <h1 id="section-title" tabindex="-1">Menu</h1>
     <p id="week-label-view" class="subtitle"></p>
   </header>
 
@@ -1195,7 +1202,7 @@ dialog.dialog-fallback[open] {
           </div>
         </div>
         <p id="extra-error" class="error" role="alert"></p>
-        <button type="submit" class="primary">Aggiungi extra</button>
+        <button type="submit" id="extra-submit" class="primary">Aggiungi extra</button>
       </form>
       <textarea id="copy-fallback" class="copy-fallback" aria-hidden="true" tabindex="-1" readonly></textarea>
     </section>
@@ -1221,8 +1228,8 @@ dialog.dialog-fallback[open] {
         <div class="stack">
           <button type="button" id="export-json" class="secondary">Esporta JSON</button>
           <button type="button" id="share-backup" class="secondary" hidden>Condividi backup</button>
-          <label class="btn secondary" for="import-file">Importa JSON</label>
           <input id="import-file" type="file" accept="application/json,.json" class="visually-hidden">
+          <label class="btn secondary" for="import-file">Importa JSON</label>
           <button type="button" id="wipe-all" class="danger">Cancella tutti i dati</button>
         </div>
       </div>
@@ -2075,7 +2082,7 @@ dialog.dialog-fallback[open] {
 (function () {
   'use strict';
 
-  var APP_VERSION = '1.0.1';
+  var APP_VERSION = '1.0.2';
   var L = window.MenuLogic;
   var TABS = ['menu', 'ricettario', 'spesa', 'altro'];
   var TAB_TITLES = { menu: 'Menu', ricettario: 'Ricettario', spesa: 'Lista della spesa', altro: 'Altro' };
@@ -2165,6 +2172,7 @@ dialog.dialog-fallback[open] {
     state.meta.updatedAt = new Date().toISOString();
     try {
       localStorage.setItem(L.STORAGE_KEY, JSON.stringify(state));
+      if (typeof syncSchedulePush === 'function') syncSchedulePush();
     } catch (e) {
       toast('Impossibile salvare: spazio esaurito', 'error');
     }
@@ -2201,6 +2209,7 @@ dialog.dialog-fallback[open] {
     saveState();
     renderShopping();
     updateWeekLabelView();
+    updateHeaderHeight();
   }
 
   function focusQuiet(node) {
@@ -2272,6 +2281,9 @@ dialog.dialog-fallback[open] {
     });
     $('#section-title').textContent = TAB_TITLES[name];
     updateWeekLabelView();
+    // Il sottotitolo (etichetta settimana) compare solo su Menu/Spesa: l'altezza dell'header
+    // cambia con il tab e i titoli reparto sticky della Spesa si agganciano a --header-h.
+    updateHeaderHeight();
     try { history.replaceState(null, '', '#' + name); } catch (e) { /* ignora */ }
     if (focusTab) $('#tab-' + name).focus();
     window.scrollTo(0, 0);
@@ -2324,9 +2336,12 @@ dialog.dialog-fallback[open] {
   function bindBanners() {
     $('#seed-banner-close').addEventListener('click', function () {
       commit(function (s) { s.settings.seedBannerDismissed = true; });
+      // il banner (e il bottone premuto) è sparito: il focus va al titolo della sezione
+      focusQuiet($('#section-title'));
     });
     $('#ios-hint-close').addEventListener('click', function () {
       commit(function (s) { s.settings.iosHintDismissed = true; });
+      focusQuiet($('#section-title'));
     });
   }
 
@@ -2711,7 +2726,9 @@ dialog.dialog-fallback[open] {
   }
 
   function renderShoppingRow(item) {
-    var check = el('input', { type: 'checkbox', class: 'row-check', 'aria-label': 'Preso: ' + item.name });
+    // Nessun aria-label: il nome accessibile viene dalla <label> che avvolge la riga
+    // («10 pz Uova», più eventuali badge), così VoiceOver legge la riga in una sola fermata.
+    var check = el('input', { type: 'checkbox', class: 'row-check' });
     check.checked = item.checked;
     check.addEventListener('change', function () {
       var on = check.checked;
@@ -2747,6 +2764,9 @@ dialog.dialog-fallback[open] {
           commit(function (s) {
             s.extras = s.extras.filter(function (x) { return x.id !== item.extraId; });
           });
+          // la riga (e il bottone premuto) non esiste più: il focus va al bottone «Aggiungi extra»
+          // (non al campo di testo, che su iPhone aprirebbe la tastiera)
+          focusQuiet($('#extra-submit'));
           toast('Extra rimosso');
         }
       }, ['Rimuovi']) : null
@@ -3006,7 +3026,11 @@ dialog.dialog-fallback[open] {
 
   function updateHeaderHeight() {
     var h = $('.app-header');
-    if (h) document.documentElement.style.setProperty('--header-h', h.offsetHeight + 'px');
+    if (!h) return;
+    // Altezza frazionaria (non offsetHeight, che arrotonda): i titoli reparto sticky
+    // devono stare esattamente a filo del bordo inferiore dell'header.
+    var height = h.getBoundingClientRect().height || h.offsetHeight;
+    document.documentElement.style.setProperty('--header-h', height + 'px');
   }
 
   function renderAll() {
@@ -3040,10 +3064,110 @@ dialog.dialog-fallback[open] {
   }
 
   /* ------------------------------------------------------------------ */
+  /* Sincronizzazione tra dispositivi (file state.json su GitHub)         */
+  /* ------------------------------------------------------------------ */
+  var SYNC = { repo: 'Masimpos/menu-spesa', path: 'state.json', tokenKey: 'menu-spesa:sync-token' };
+  var syncSha = null, syncReady = false, syncFresh = false, syncPushTimer = null, syncBusy = false, syncPill = null;
+
+  function syncToken() { try { return localStorage.getItem(SYNC.tokenKey) || ''; } catch (e) { return ''; } }
+  function syncSetStatus(txt, bad) {
+    if (!syncPill) return;
+    syncPill.textContent = txt;
+    syncPill.style.background = bad ? '#b3261e' : '#1b6e3c';
+  }
+  function b64e(s) { return btoa(unescape(encodeURIComponent(s))); }
+  function b64d(s) { return decodeURIComponent(escape(atob(String(s).replace(/\s/g, '')))); }
+  function ghReq(method, body) {
+    var url = 'https://api.github.com/repos/' + SYNC.repo + '/contents/' + SYNC.path + (method === 'GET' ? '?t=' + Date.now() : '');
+    return fetch(url, {
+      method: method, cache: 'no-store',
+      headers: { 'Authorization': 'Bearer ' + syncToken(), 'Accept': 'application/vnd.github+json' },
+      body: body ? JSON.stringify(body) : undefined
+    });
+  }
+  function syncEditing() {
+    var el = document.activeElement;
+    return !!(el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
+  }
+  function syncPull() {
+    if (!syncToken() || syncBusy) return Promise.resolve();
+    syncBusy = true; syncSetStatus('Sync...');
+    return ghReq('GET').then(function (r) {
+      if (r.status === 404) { syncSha = null; syncReady = true; return 'none'; }
+      if (r.status === 401 || r.status === 403) throw new Error('Token non valido');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (j) {
+      syncBusy = false;
+      if (j === 'none') { return syncPush(); }
+      syncSha = j.sha; syncReady = true;
+      var remote = JSON.parse(b64d(j.content));
+      var rt = (remote && remote.meta && remote.meta.updatedAt) || '';
+      var lt = state.meta.updatedAt || '';
+      if (rt && (syncFresh || rt > lt)) {
+        if (syncEditing() && !syncFresh) { syncSetStatus('Sync in attesa'); return; }
+        syncFresh = false;
+        state = L.normalizeState(remote);
+        try { localStorage.setItem(L.STORAGE_KEY, JSON.stringify(state)); } catch (e) { /* ignora */ }
+        pruneShoppingFlags(); renderAll();
+        syncSetStatus('Sync ok');
+      } else if (lt > rt) {
+        syncFresh = false;
+        return syncPush();
+      } else { syncFresh = false; syncSetStatus('Sync ok'); }
+    }).catch(function (e) {
+      syncBusy = false; syncSetStatus('Sync errore: ' + ((e && e.message) || e), true);
+    });
+  }
+  function syncPush() {
+    if (!syncToken() || !syncReady || syncBusy) return Promise.resolve();
+    syncBusy = true; syncSetStatus('Sync...');
+    var body = { message: 'sync ' + state.meta.updatedAt, content: b64e(JSON.stringify(state)) };
+    if (syncSha) body.sha = syncSha;
+    return ghReq('PUT', body).then(function (r) {
+      syncBusy = false;
+      if (r.status === 409 || r.status === 422) { syncReady = false; return syncPull(); }
+      if (r.status === 401 || r.status === 403) throw new Error('Token non valido');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json().then(function (j) { syncSha = j.content.sha; syncSetStatus('Sync ok'); });
+    }).catch(function (e) {
+      syncBusy = false; syncSetStatus('Sync errore: ' + ((e && e.message) || e), true);
+    });
+  }
+  function syncSchedulePush() {
+    if (!syncToken() || !syncReady) return;
+    if (syncPushTimer) clearTimeout(syncPushTimer);
+    syncPushTimer = setTimeout(function () { syncPushTimer = null; syncPush(); }, 1500);
+  }
+  function syncSetup() {
+    syncPill = document.createElement('button');
+    syncPill.type = 'button';
+    syncPill.style.cssText = 'position:fixed;right:8px;bottom:8px;z-index:9999;border:0;border-radius:14px;padding:4px 10px;font-size:12px;color:#fff;opacity:.85;background:#555;';
+    syncPill.textContent = syncToken() ? 'Sync...' : 'Sync: non attivo';
+    syncPill.addEventListener('click', function () {
+      if (!syncToken()) {
+        var t = window.prompt('Incolla il token GitHub per attivare la sincronizzazione:');
+        if (t && t.trim()) { try { localStorage.setItem(SYNC.tokenKey, t.trim()); } catch (e) { /* ignora */ } syncReady = false; syncPull(); }
+      } else {
+        var c = window.prompt('Sincronizzazione attiva.\nOK = sincronizza ora.\nScrivi off per disattivarla su questo dispositivo.');
+        if (c === null) return;
+        if (String(c).trim().toLowerCase() === 'off') { try { localStorage.removeItem(SYNC.tokenKey); } catch (e) { /* ignora */ } syncReady = false; syncSetStatus('Sync: non attivo'); syncPill.style.background = '#555'; }
+        else { syncReady = false; syncPull(); }
+      }
+    });
+    document.body.appendChild(syncPill);
+    if (syncToken()) syncPull();
+    setInterval(function () { if (!document.hidden) { syncReady = false; syncPull(); } }, 20000);
+    document.addEventListener('visibilitychange', function () { if (!document.hidden) { syncReady = false; syncPull(); } });
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Avvio                                                               */
+
   /* ------------------------------------------------------------------ */
 
   function init() {
+    try { syncFresh = !localStorage.getItem(L.STORAGE_KEY); } catch (e) { syncFresh = false; }
     state = loadState();
     bindTabs();
     bindBanners();
@@ -3053,6 +3177,11 @@ dialog.dialog-fallback[open] {
     bindShopping();
     bindAltro();
     window.addEventListener('resize', updateHeaderHeight);
+    // Rete di sicurezza: qualunque variazione dell'header (etichetta che va a capo,
+    // dimensione del testo di sistema, rotazione) aggiorna --header-h anche senza commit.
+    if (typeof ResizeObserver === 'function') {
+      try { new ResizeObserver(updateHeaderHeight).observe($('.app-header')); } catch (e) { /* ignora */ }
+    }
 
     pruneShoppingFlags();
     renderAll();
@@ -3060,6 +3189,7 @@ dialog.dialog-fallback[open] {
     showTab(TABS.indexOf(hash) >= 0 ? hash : 'menu');
     if (!state.meta.updatedAt) saveState();
     registerServiceWorker();
+    syncSetup();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
